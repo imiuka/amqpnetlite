@@ -273,6 +273,7 @@ namespace Amqp
             }
 
             Delivery.ReleaseAll(toRelease, error);
+            Delivery.ReleaseAll(this.Session.RemoveDeliveries(this), error);
         }
 
         static byte[] GetDeliveryTag(uint tag)

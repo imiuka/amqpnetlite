@@ -441,6 +441,32 @@ namespace Amqp
             };
         }
 
+        internal Delivery RemoveDeliveries(Link link)
+        {
+            LinkedList list = null;
+            lock (this.ThisLock)
+            {
+                Delivery temp = (Delivery)this.outgoingList.First;
+                while (temp != null)
+                {
+                    Delivery curr = temp;
+                    temp = (Delivery)temp.Next;
+                    if (curr.Link == link)
+                    {
+                        this.outgoingList.Remove(curr);
+                        if (list == null)
+                        {
+                            list = new LinkedList();
+                        }
+
+                        list.Add(curr);
+                    }
+                }
+            }
+
+            return list == null ? null : (Delivery)list.First;
+        }
+
         void CancelPendingDeliveries(Error error)
         {
             Delivery toRealse;
@@ -560,11 +586,12 @@ namespace Amqp
                     if (delivery.DeliveryId >= first)
                     {
                         delivery.Settled = dispose.Settled;
-                        delivery.OnStateChange(dispose.State);
                         if (delivery.Settled)
                         {
                             linkedList.Remove(delivery);
                         }
+
+                        delivery.OnStateChange(dispose.State);
                     }
 
                     delivery = next;

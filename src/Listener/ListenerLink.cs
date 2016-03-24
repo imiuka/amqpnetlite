@@ -18,6 +18,7 @@
 namespace Amqp.Listener
 {
     using System;
+    using System.Threading;
     using Amqp.Framing;
     using Amqp.Types;
 
@@ -27,8 +28,14 @@ namespace Amqp.Listener
     /// </summary>
     public class ListenerLink : Link
     {
+        /// <summary>
+        /// The event handler to be invoked when the link starts closing.
+        /// </summary>
+        public event EventHandler Closing;
+
         bool role;
         object state;
+        int credit;
 
         // caller can initialize the link for an endpoint, a sender or a receiver
         // based on its needs.
@@ -42,7 +49,6 @@ namespace Amqp.Listener
 
         // receive
         SequenceNumber deliveryCount;
-        uint credit;
         bool autoRestore;
         int restored;
         Delivery deliveryCurrent;
@@ -94,7 +100,7 @@ namespace Amqp.Listener
         {
             ThrowIfNotNull(this.linkEndpoint, "endpoint");
             ThrowIfNotNull(this.onMessage, "receiver");
-            this.credit = credit;
+            this.credit = (int)credit;
             this.autoRestore = true;
             this.onMessage = onMessage;
             this.state = state;
@@ -132,22 +138,7 @@ namespace Amqp.Listener
         /// <param name="buffer">The serialized buffer of the message. It is null, the message is serialized.</param>
         public void SendMessage(Message message, ByteBuffer buffer)
         {
-            if (this.role)
-            {
-                throw new AmqpException(ErrorCode.NotAllowed, "Cannot send a message over a receiving link.");
-            }
-
-            Delivery delivery = new Delivery()
-            {
-                Handle = this.Handle,
-                Message = message,
-                Buffer = buffer ?? message.Encode(),
-                Link = this,
-                Settled = this.SettleOnSend
-            };
-
-            this.Session.SendDelivery(delivery);
-            this.deliveryCount++;
+            this.SendMessageInternal(message, buffer, null);
         }
 
         /// <summary>
@@ -165,7 +156,7 @@ namespace Amqp.Listener
                     if (this.restored++ >= this.credit / 2)
                     {
                         this.restored = 0;
-                        this.SendFlow(this.deliveryCount, this.credit, false);
+                        this.SendFlow(this.deliveryCount, (uint)this.credit, false);
                     }
                 }
             }
@@ -206,7 +197,7 @@ namespace Amqp.Listener
             {
                 if (this.credit > 0)
                 {
-                    this.SendFlow(this.deliveryCount, credit, false);
+                    this.SendFlow(this.deliveryCount, (uint)credit, false);
                 }
             }
         }
@@ -223,14 +214,14 @@ namespace Amqp.Listener
             this.ThrowIfDetaching("set-credit");
             lock (this.ThisLock)
             {
-                this.credit = (uint)credit;
+                this.credit = credit;
                 this.autoRestore = autoRestore;
                 this.restored = 0;
-                this.SendFlow(this.deliveryCount, this.credit, drain);
+                this.SendFlow(this.deliveryCount, (uint)this.credit, drain);
             }
         }
 
-        internal void InitializeLinkEndpoint(LinkEndpoint linkEndpoint, uint credit)
+        internal void InitializeLinkEndpoint(LinkEndpoint linkEndpoint, int credit)
         {
             ThrowIfNotNull(this.linkEndpoint, "endpoint");
             ThrowIfNotNull(this.onMessage, "receiver");
@@ -239,6 +230,34 @@ namespace Amqp.Listener
             this.credit = credit;
             this.autoRestore = true;
             this.linkEndpoint = linkEndpoint;
+        }
+
+        internal int SendMessageInternal(Message message, ByteBuffer buffer, object userToken)
+        {
+            if (this.role)
+            {
+                throw new AmqpException(ErrorCode.NotAllowed, "Cannot send a message over a receiving link.");
+            }
+
+            this.ThrowIfDetaching("Send");
+            Delivery delivery = new Delivery()
+            {
+                Handle = this.Handle,
+                Message = message,
+                Buffer = buffer ?? message.Encode(),
+                Link = this,
+                Settled = this.SettleOnSend,
+                UserToken = userToken
+            };
+
+            this.Session.SendDelivery(delivery);
+            this.deliveryCount++;
+            return Interlocked.Decrement(ref this.credit);
+        }
+
+        internal int AddCredit(int credit)
+        {
+            return Interlocked.Add(ref this.credit, credit);
         }
 
         internal override void OnAttach(uint remoteHandle, Attach attach)
@@ -331,10 +350,7 @@ namespace Amqp.Listener
             }
             finally
             {
-                if (this.linkEndpoint != null)
-                {
-                    this.linkEndpoint.OnLinkClosed(this, error);
-                }                
+                this.NotifyClosing(error);
             }
         }
 
@@ -344,10 +360,7 @@ namespace Amqp.Listener
         /// <param name="error">The error.</param>
         protected override void OnAbort(Error error)
         {
-            if (this.linkEndpoint != null)
-            {
-                this.linkEndpoint.OnLinkClosed(this, error);
-            }
+            this.NotifyClosing(error);
         }
 
         static void ThrowIfNotNull(object obj, string name)
@@ -369,6 +382,29 @@ namespace Amqp.Listener
             else if (this.linkEndpoint != null)
             {
                 this.linkEndpoint.OnMessage(new MessageContext(this, delivery.Message));
+            }
+        }
+
+        void NotifyClosing(Error error)
+        {
+            EventHandler handler = this.Closing;
+            if (handler != null)
+            {
+                handler(this, EventArgs.Empty);
+            }
+
+            Delivery pending = this.Session.RemoveDeliveries(this);
+            while (pending != null)
+            {
+                pending.State = new Released();
+                pending.Settled = true;
+                this.OnDeliveryStateChanged(pending);
+                pending = (Delivery)pending.Next;
+            }
+
+            if (this.linkEndpoint != null)
+            {
+                this.linkEndpoint.OnLinkClosed(this, error);
             }
         }
     }

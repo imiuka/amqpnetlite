@@ -529,7 +529,7 @@ namespace Listener.IContainer
                     this.link = link;
                     this.id = id;
 
-                    link.Closed += this.OnLinkClosed;
+                    link.Closing += this.OnLinkClosed;
                     link.InitializeSender(onCredit, onDispose, this);
                 }
 
@@ -547,7 +547,7 @@ namespace Listener.IContainer
                     return new ArraySegment<byte>(BitConverter.GetBytes(Interlocked.Increment(ref this.tag)));
                 }
 
-                void OnLinkClosed(AmqpObject sender, Error error)
+                void OnLinkClosed(object sender, EventArgs args)
                 {
                     this.Credit = 0;
                     this.queue.OnConsumerClosed(this.id, this);

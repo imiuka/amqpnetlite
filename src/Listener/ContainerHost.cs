@@ -21,27 +21,44 @@ namespace Amqp.Listener
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.Security.Cryptography.X509Certificates;
+    using System.Threading.Tasks;
     using Amqp.Framing;
     using Amqp.Types;
 
     /// <summary>
-    /// The ContainerHost class hosts an AMQP container where connection listeners can be
-    /// created to accept client requests.
+    /// The ContainerHost class hosts an AMQP container where connection
+    /// listeners can be created to accept client requests.
     /// </summary>
     /// <remarks>
-    /// A container has one or more connection endpoints where transport listeners are created.
-    /// Message processors can be registered to accept incoming messages (one-way).
-    /// Request processors can be registered to process request messages and send back response
-    /// messages (two-way).
-    /// Link processor can be registered to process received attach performatives. This is
-    /// useful in implementing scenarios such as:
-    /// (1) Extra resource allocation and/or additional validation of the request is required.
-    /// (2) Accept receiving links from the client. The listener acts as the message source.
-    /// Upon receiving an attach performative, the registered message processor(s)
-    /// and request processor(s) are checked first. If a processor matches the address
-    /// on the received attach performative, it is invoked to handle the command.
-    /// Otherwise, the registered link processor, if any, is invoked to handle the command.
-    /// When no processor is found, the link is detached with error "amqp:not-found".
+    /// A container has one or more connection endpoints where transport
+    /// listeners are created.
+    /// 
+    /// Message-level Processing
+    ///  * IMessageProcessor: message processors can be registered to accept
+    ///    incoming messages (one-way incoming).
+    ///  * IMessageSource: message sources can be registered to handle
+    ///    receive requests (one-way outgoing).
+    ///  * IRequestProcessor: request processors can be registered to
+    ///    process request messages and send back response (two-way).
+    /// 
+    /// Link-level Processing
+    /// Message level processing only deals with incoming and outgoing messages
+    /// without worrying about the links.
+    /// Link processors (ILinkProcessor) can be registered to process received
+    /// attach performatives. This is useful when the application needs to
+    /// participate in link attach/detach for extra resource allocation/cleanup,
+    /// or perform additional validation and security enforcement at the link level.
+    /// Link processors create link endpoints which can be either message sink
+    /// or message source.
+    ///
+    /// Upon receiving an attach performative, the registered message level
+    /// processors (IMessageProcessor, IMessageSource, IRequestProcessor) are
+    /// checked first. If a processor matches the address on the received attach
+    /// performative, a link is automatically created and the send/receive requests
+    /// will be rounted to the associated processor.
+    /// Otherwise, the registered link processor, if any, is invoked to create a
+    /// LinkEndpoint, where subsequent send/receive requests will be routed.
+    /// When none is found, the link is detached with error "amqp:not-found".
     /// </remarks>
     public class ContainerHost : IContainer
     {
@@ -52,6 +69,7 @@ namespace Amqp.Listener
         readonly ClosedCallback onLinkClosed;
         readonly Dictionary<string, MessageProcessor> messageProcessors;
         readonly Dictionary<string, RequestProcessor> requestProcessors;
+        readonly Dictionary<string, MessageSource> messageSources;
         ILinkProcessor linkProcessor;
 
         /// <summary>
@@ -77,6 +95,7 @@ namespace Amqp.Listener
             this.onLinkClosed = this.OnLinkClosed;
             this.messageProcessors = new Dictionary<string, MessageProcessor>(StringComparer.OrdinalIgnoreCase);
             this.requestProcessors = new Dictionary<string, RequestProcessor>(StringComparer.OrdinalIgnoreCase);
+            this.messageSources = new Dictionary<string, MessageSource>(StringComparer.OrdinalIgnoreCase);
             this.listeners = new ConnectionListener[addressUriList.Count];
             for (int i = 0; i < addressUriList.Count; i++)
             {
@@ -163,6 +182,17 @@ namespace Amqp.Listener
         }
 
         /// <summary>
+        /// Registers a message source at the specified address where client receives messages.
+        /// When it is called, the container creates a node where the client can attach.
+        /// </summary>
+        /// <param name="address">The address.</param>
+        /// <param name="messageSource">The message source to be registered.</param>
+        public void RegisterMessageSource(string address, IMessageSource messageSource)
+        {
+            AddProcessor(this.messageSources, address, new MessageSource(messageSource));
+        }
+
+        /// <summary>
         /// Unregisters a message processor at the specified address.
         /// </summary>
         /// <param name="address">The address.</param>
@@ -178,6 +208,15 @@ namespace Amqp.Listener
         public void UnregisterRequestProcessor(string address)
         {
             RemoveProcessor(this.requestProcessors, address);
+        }
+
+        /// <summary>
+        /// Unregisters a message source at the specified address.
+        /// </summary>
+        /// <param name="address">The address.</param>
+        public void UnregisterMessageSource(string address)
+        {
+            RemoveProcessor(this.messageSources, address);
         }
 
         static void AddProcessor<T>(Dictionary<string, T> processors, string address, T processor)
@@ -259,6 +298,13 @@ namespace Amqp.Listener
             if (TryGetProcessor(this.requestProcessors, address, out requestProcessor))
             {
                 requestProcessor.AddLink(listenerLink, address, attach);
+                return true;
+            }
+
+            MessageSource messageSource;
+            if (TryGetProcessor(this.messageSources, address, out messageSource))
+            {
+                messageSource.AddLink(listenerLink, address);
                 return true;
             }
 
@@ -451,6 +497,91 @@ namespace Amqp.Listener
                     }
 
                     this.responseLinks.Clear();
+                }
+            }
+        }
+
+        class MessageSource : IDisposable
+        {
+            readonly IMessageSource messageSource;
+            readonly HashSet<ListenerLink> links;
+
+            public MessageSource(IMessageSource messageSource)
+            {
+                this.messageSource = messageSource;
+                this.links = new HashSet<ListenerLink>();
+            }
+
+            public void AddLink(ListenerLink link, string address)
+            {
+                if (link.Role)
+                {
+                    throw new AmqpException(ErrorCode.NotAllowed, "Only receiver link can be attached at " + address);
+                }
+
+                link.InitializeSender(this.OnCredit, this.OnDisposition, link);
+                link.Closed += this.OnLinkClosed;
+                lock (this.links)
+                {
+                    this.links.Add(link);
+                }
+            }
+
+            void OnCredit(int credit, object state)
+            {
+                var link = (ListenerLink)state;
+                if (link.AddCredit(credit) == credit)
+                {
+                    Task.Factory.StartNew(() => this.ReceiveAsync(link));
+                }
+            }
+
+            void OnDisposition(Message message, DeliveryState deliveryState, bool settled, object state)
+            {
+                var context = (ReceiveContext)message.Delivery.UserToken;
+                context.Complete(deliveryState);
+            }
+
+            void OnLinkClosed(AmqpObject sender, Error error)
+            {
+                ListenerLink link = (ListenerLink)sender;
+                lock (this.links)
+                {
+                    this.links.Remove(link);
+                }
+            }
+
+            async Task ReceiveAsync(ListenerLink link)
+            {
+                while (link.LinkState < LinkState.DetachPipe)
+                {
+                    ReceiveContext context = await this.messageSource.GetMessageAsync(link);
+                    if (context != null)
+                    {
+                        int remaining = link.SendMessageInternal(context.Message, null, context);
+                        if (remaining == 0)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            void IDisposable.Dispose()
+            {
+                lock (this.links)
+                {
+                    foreach (var link in this.links)
+                    {
+                        link.Closed -= OnLinkClosed;
+                        link.Close(0, new Error()
+                            {
+                                Condition = ErrorCode.DetachForced,
+                                Description = "Source was unregistered."
+                            });
+                    }
+
+                    this.links.Clear();
                 }
             }
         }

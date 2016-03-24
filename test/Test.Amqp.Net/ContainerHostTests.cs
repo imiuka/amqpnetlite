@@ -20,6 +20,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
+using System.Threading.Tasks;
 using Amqp;
 using Amqp.Framing;
 using Amqp.Listener;
@@ -49,8 +50,8 @@ namespace Test.Amqp
         [ClassInitialize]
         public static void Initialize(TestContext context)
         {
-            //Trace.TraceLevel = TraceLevel.Frame;
-            //Trace.TraceListener = (f, a) => System.Diagnostics.Trace.WriteLine(DateTime.Now.ToString("[hh:ss.fff]") + " " + string.Format(f, a));
+            Trace.TraceLevel = TraceLevel.Frame;
+            Trace.TraceListener = (f, a) => System.Diagnostics.Trace.WriteLine(DateTime.Now.ToString("[hh:ss.fff]") + " " + string.Format(f, a));
         }
 
         [TestInitialize]
@@ -103,6 +104,52 @@ namespace Test.Amqp
                 var message = processor.Messages[i];
                 Assert.AreEqual("msg" + i, message.GetBody<string>());
             }
+        }
+
+        [TestMethod]
+        public void ContainerHostMessageSourceTest()
+        {
+            string name = MethodInfo.GetCurrentMethod().Name;
+            int count = 100;
+            Queue<Message> messages = new Queue<Message>();
+            for (int i = 0; i < count; i++)
+            {
+                messages.Enqueue(new Message("test") { Properties = new Properties() { MessageId = name + i } });
+            }
+
+            var source = new TestMessageSource(messages);
+            this.host.RegisterMessageSource(name, source);
+
+            var connection = new Connection(Address);
+            var session = new Session(connection);
+            var receiver = new ReceiverLink(session, "receiver0", name);
+            int released = 0;
+            int rejected = 0;
+            for (int i = 1; i <= count; i++)
+            {
+                Message message = receiver.Receive();
+                if (i % 5 == 0)
+                {
+                    receiver.Reject(message);
+                    rejected++;
+                }
+                else if (i % 17 == 0)
+                {
+                    receiver.Release(message);
+                    released++;
+                }
+                else
+                {
+                    receiver.Accept(message);
+                }
+            }
+
+            receiver.Close();
+            session.Close();
+            connection.Close();
+
+            Assert.AreEqual(released, messages.Count);
+            Assert.AreEqual(rejected, source.DeadletterMessage.Count);
         }
 
         [TestMethod]
@@ -671,6 +718,65 @@ namespace Test.Amqp
         {
             int id = Interlocked.Increment(ref this.totalCount);
             requestContext.Complete(new Message("OK" + id));
+        }
+    }
+
+    class TestMessageSource : IMessageSource
+    {
+        readonly Queue<Message> messages;
+        readonly List<Message> deadletterMessage;
+
+        public TestMessageSource(Queue<Message> messages)
+        {
+            this.messages = messages;
+            this.deadletterMessage = new List<Message>();
+        }
+
+        public IList<Message> DeadletterMessage
+        {
+            get { return this.deadletterMessage; }
+        }
+
+        public Task<ReceiveContext> GetMessageAsync(ListenerLink link)
+        {
+            lock (this.messages)
+            {
+                ReceiveContext context = null;
+                if (this.messages.Count > 0)
+                {
+                    context = new TestReceiveContext(this, link, this.messages.Dequeue());
+                }
+
+                return Task.FromResult(context);
+            }
+        }
+
+        class TestReceiveContext : ReceiveContext
+        {
+            TestMessageSource source;
+
+            public TestReceiveContext(TestMessageSource source, ListenerLink link, Message message)
+                : base(link, message)
+            {
+                this.source = source;
+            }
+
+            public override void Complete(DeliveryState deliveryState)
+            {
+                if (deliveryState is Rejected)
+                {
+                    this.source.deadletterMessage.Add(this.Message);
+                    base.Complete(deliveryState);
+                }
+                else if (deliveryState is Released)
+                {
+                    this.Link.DisposeMessage(this.Message, deliveryState, true);
+                    lock (this.source.messages)
+                    {
+                        this.source.messages.Enqueue(this.Message);
+                    }
+                }
+            }
         }
     }
 

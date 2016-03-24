@@ -55,7 +55,7 @@ namespace Amqp.Listener
         /// <param name="initialCredit">The initial credit to send to peer for a receiving link endpoint. It is ignored for a sending endpoint.</param>
         public void Complete(LinkEndpoint linkEndpoint, int initialCredit)
         {
-            this.Link.InitializeLinkEndpoint(linkEndpoint, (uint)initialCredit);
+            this.Link.InitializeLinkEndpoint(linkEndpoint, initialCredit);
             this.Link.CompleteAttach(this.Attach, null);
         }
 
