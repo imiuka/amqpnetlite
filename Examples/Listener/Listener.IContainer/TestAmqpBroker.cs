@@ -432,6 +432,7 @@ namespace Listener.IContainer
             {
                 lock (this.syncRoot)
                 {
+                    consumer.Credit = 0;
                     this.consumers.Remove(id);
                     var node = this.messages.First;
                     while (node != null)
@@ -549,7 +550,6 @@ namespace Listener.IContainer
 
                 void OnLinkClosed(object sender, EventArgs args)
                 {
-                    this.Credit = 0;
                     this.queue.OnConsumerClosed(this.id, this);
                 }
 

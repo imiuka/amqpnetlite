@@ -184,8 +184,8 @@ namespace Amqp
         {
             lock (this.ThisLock)
             {
+                this.ThrowIfEnded("Send");
                 this.outgoingList.Add(delivery);
-
                 this.WriteDelivery(delivery);
             }
         }

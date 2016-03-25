@@ -50,8 +50,8 @@ namespace Test.Amqp
         [ClassInitialize]
         public static void Initialize(TestContext context)
         {
-            Trace.TraceLevel = TraceLevel.Frame;
-            Trace.TraceListener = (f, a) => System.Diagnostics.Trace.WriteLine(DateTime.Now.ToString("[hh:ss.fff]") + " " + string.Format(f, a));
+            //Trace.TraceLevel = TraceLevel.Frame;
+            //Trace.TraceListener = (f, a) => System.Diagnostics.Trace.WriteLine(DateTime.Now.ToString("[hh:ss.fff]") + " " + string.Format(f, a));
         }
 
         [TestInitialize]
@@ -229,6 +229,79 @@ namespace Test.Amqp
             sender.Close();
             session.Close();
             connection.Close();
+        }
+
+        [TestMethod]
+        public void ContainerHostTargetLinkEndpointTest()
+        {
+            string name = MethodInfo.GetCurrentMethod().Name;
+            List<Message> messages = new List<Message>();
+            this.host.RegisterLinkProcessor(
+                new TestLinkProcessor(link => new TargetLinkEndpoint(new TestMessageProcessor(50, messages), link)));
+
+            int count = 190;
+            var connection = new Connection(Address);
+            var session = new Session(connection);
+            var sender = new SenderLink(session, "send-link", "any");
+
+            for (int i = 0; i < count; i++)
+            {
+                var message = new Message("msg" + i);
+                message.Properties = new Properties() { GroupId = name };
+                sender.Send(message, SendTimeout);
+            }
+
+            sender.Close();
+            session.Close();
+            connection.Close();
+
+            Assert.AreEqual(count, messages.Count);
+        }
+
+        [TestMethod]
+        public void ContainerHostSourceLinkEndpointTest()
+        {
+            string name = MethodInfo.GetCurrentMethod().Name;
+            int count = 100;
+            Queue<Message> messages = new Queue<Message>();
+            for (int i = 0; i < count; i++)
+            {
+                messages.Enqueue(new Message("test") { Properties = new Properties() { MessageId = name + i } });
+            }
+
+            var source = new TestMessageSource(messages);
+            this.host.RegisterLinkProcessor(new TestLinkProcessor(link => new SourceLinkEndpoint(source, link)));
+
+            var connection = new Connection(Address);
+            var session = new Session(connection);
+            var receiver = new ReceiverLink(session, "receiver0", name);
+            int released = 0;
+            int rejected = 0;
+            for (int i = 1; i <= count; i++)
+            {
+                Message message = receiver.Receive();
+                if (i % 5 == 0)
+                {
+                    receiver.Reject(message);
+                    rejected++;
+                }
+                else if (i % 17 == 0)
+                {
+                    receiver.Release(message);
+                    released++;
+                }
+                else
+                {
+                    receiver.Accept(message);
+                }
+            }
+
+            receiver.Close();
+            session.Close();
+            connection.Close();
+
+            Assert.AreEqual(released, messages.Count);
+            Assert.AreEqual(rejected, source.DeadletterMessage.Count);
         }
 
         [TestMethod]
@@ -783,6 +856,16 @@ namespace Test.Amqp
     class TestLinkProcessor : ILinkProcessor
     {
         public Action<ListenerLink> OnLinkAttached;
+        readonly Func<ListenerLink, LinkEndpoint> factory;
+
+        public TestLinkProcessor()
+        {
+        }
+
+        public TestLinkProcessor(Func<ListenerLink, LinkEndpoint> factory)
+        {
+            this.factory = factory;
+        }
 
         public void Process(AttachContext attachContext)
         {
@@ -791,7 +874,9 @@ namespace Test.Amqp
                 this.OnLinkAttached(attachContext.Link);
             }
 
-            attachContext.Complete(new TestLinkEndpoint(), attachContext.Attach.Role ? 0 : 30);
+            attachContext.Complete(
+                this.factory != null ? this.factory(attachContext.Link) : new TestLinkEndpoint(),
+                attachContext.Attach.Role ? 0 : 30);
         }
 
         class TestLinkEndpoint : LinkEndpoint

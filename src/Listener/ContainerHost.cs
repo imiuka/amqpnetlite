@@ -504,12 +504,12 @@ namespace Amqp.Listener
         class MessageSource : IDisposable
         {
             readonly IMessageSource messageSource;
-            readonly HashSet<ListenerLink> links;
+            readonly Dictionary<ListenerLink, SourceLinkEndpoint> endpoints;
 
             public MessageSource(IMessageSource messageSource)
             {
                 this.messageSource = messageSource;
-                this.links = new HashSet<ListenerLink>();
+                this.endpoints = new Dictionary<ListenerLink, SourceLinkEndpoint>();
             }
 
             public void AddLink(ListenerLink link, string address)
@@ -519,59 +519,49 @@ namespace Amqp.Listener
                     throw new AmqpException(ErrorCode.NotAllowed, "Only receiver link can be attached at " + address);
                 }
 
+                SourceLinkEndpoint endpoint = new SourceLinkEndpoint(this.messageSource, link);
                 link.InitializeSender(this.OnCredit, this.OnDisposition, link);
                 link.Closed += this.OnLinkClosed;
-                lock (this.links)
+                lock (this.endpoints)
                 {
-                    this.links.Add(link);
+                    this.endpoints.Add(link, endpoint);
                 }
             }
 
             void OnCredit(int credit, object state)
             {
                 var link = (ListenerLink)state;
-                if (link.AddCredit(credit) == credit)
+                SourceLinkEndpoint endpoint;
+                if (this.endpoints.TryGetValue(link, out endpoint))
                 {
-                    Task.Factory.StartNew(() => this.ReceiveAsync(link));
+                    endpoint.OnFlow(new FlowContext(link, credit, null));
                 }
             }
 
             void OnDisposition(Message message, DeliveryState deliveryState, bool settled, object state)
             {
-                var context = (ReceiveContext)message.Delivery.UserToken;
-                context.Complete(deliveryState);
+                var link = (ListenerLink)state;
+                SourceLinkEndpoint endpoint;
+                if (this.endpoints.TryGetValue(link, out endpoint))
+                {
+                    endpoint.OnDisposition(new DispositionContext(link, message, deliveryState, settled));
+                }
             }
 
             void OnLinkClosed(AmqpObject sender, Error error)
             {
                 ListenerLink link = (ListenerLink)sender;
-                lock (this.links)
+                lock (this.endpoints)
                 {
-                    this.links.Remove(link);
-                }
-            }
-
-            async Task ReceiveAsync(ListenerLink link)
-            {
-                while (link.LinkState < LinkState.DetachPipe)
-                {
-                    ReceiveContext context = await this.messageSource.GetMessageAsync(link);
-                    if (context != null)
-                    {
-                        int remaining = link.SendMessageInternal(context.Message, null, context);
-                        if (remaining == 0)
-                        {
-                            break;
-                        }
-                    }
+                    this.endpoints.Remove(link);
                 }
             }
 
             void IDisposable.Dispose()
             {
-                lock (this.links)
+                lock (this.endpoints)
                 {
-                    foreach (var link in this.links)
+                    foreach (var link in this.endpoints.Keys)
                     {
                         link.Closed -= OnLinkClosed;
                         link.Close(0, new Error()
@@ -581,7 +571,7 @@ namespace Amqp.Listener
                             });
                     }
 
-                    this.links.Clear();
+                    this.endpoints.Clear();
                 }
             }
         }

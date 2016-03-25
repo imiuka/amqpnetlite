@@ -63,6 +63,8 @@
     <Compile Include="Listener\ListenerLink.cs" />
     <Compile Include="Listener\SaslMechanism.cs" />
     <Compile Include="Listener\SaslPlainMechanism.cs" />
+    <Compile Include="Listener\SourceLinkEndpoint.cs" />
+    <Compile Include="Listener\TargetLinkEndpoint.cs" />
     <Compile Include="Listener\X509Identity.cs" />
     <Compile Include="Net\ResourceManager.cs" />
     <Compile Include="Net\BufferManager.cs" />
