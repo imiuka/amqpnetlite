@@ -17,6 +17,7 @@
 
 namespace Amqp
 {
+    using System;
     using System.Threading;
     using Amqp.Framing;
     using Amqp.Types;
@@ -59,7 +60,19 @@ namespace Amqp
         /// <param name="name">The link name.</param>
         /// <param name="address">The node address.</param>
         public ReceiverLink(Session session, string name, string address)
-            : this(session, name, new Source() { Address = address }, null)
+            : this(session, name, address, DefaultCredit)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a receiver link.
+        /// </summary>
+        /// <param name="session">The session within which to create the link.</param>
+        /// <param name="name">The link name.</param>
+        /// <param name="credit">The initial credit auto-restored to give to this link.</param>
+        /// <param name="address">The node address.</param>
+        public ReceiverLink(Session session, string name, string address, int credit)
+            : this(session, name, credit, new Source() { Address = address }, null)
         {
         }
 
@@ -71,7 +84,20 @@ namespace Amqp
         /// <param name="source">The source on attach that specifies the message source.</param>
         /// <param name="onAttached">The callback to invoke when an attach is received from peer.</param>
         public ReceiverLink(Session session, string name, Source source, OnAttached onAttached)
-            : this(session, name, new Attach() { Source = source, Target = new Target() }, onAttached)
+            : this(session, name, DefaultCredit, source, onAttached)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a receiver link.
+        /// </summary>
+        /// <param name="session">The session within which to create the link.</param>
+        /// <param name="name">The link name.</param>
+        /// <param name="credit">The initial credit auto-restored to give to this link.</param>
+        /// <param name="source">The source on attach that specifies the message source.</param>
+        /// <param name="onAttached">The callback to invoke when an attach is received from peer.</param>
+        public ReceiverLink(Session session, string name, int credit, Source source, OnAttached onAttached)
+            : this(session, name, credit, new Attach() { Source = source, Target = new Target() }, onAttached)
         {
         }
 
@@ -83,12 +109,26 @@ namespace Amqp
         /// <param name="attach">The attach frame to send for this link.</param>
         /// <param name="onAttached">The callback to invoke when an attach is received from peer.</param>
         public ReceiverLink(Session session, string name, Attach attach, OnAttached onAttached)
+            : this(session, name, DefaultCredit, attach, onAttached)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a receiver link.
+        /// </summary>
+        /// <param name="session">The session within which to create the link.</param>
+        /// <param name="name">The link name.</param>
+        /// <param name="credit">The initial credit auto-restored to give to this link.</param>
+        /// <param name="attach">The attach frame to send for this link.</param>
+        /// <param name="onAttached">The callback to invoke when an attach is received from peer.</param>
+        public ReceiverLink(Session session, string name, int credit, Attach attach, OnAttached onAttached)
             : base(session, name, onAttached)
         {
-            this.totalCredit = -1;
+            var local = this.SetLocalCredit(credit);
             this.receivedMessages = new LinkedList();
             this.waiterList = new LinkedList();
             this.SendAttach(true, 0, attach);
+            this.SendFlow(local.Item1, (uint)credit, false);
         }
 
         /// <summary>
@@ -111,21 +151,25 @@ namespace Amqp
         /// or rejected by the caller. If false, caller is responsible for manage link credits.</param>
         public void SetCredit(int credit, bool autoRestore = true)
         {
-            uint dc;
+            var tuple = SetLocalCredit(credit, autoRestore);
+
+            if (tuple.Item2)
+                this.SendFlow(tuple.Item1, (uint)credit, false);
+        }
+
+        // todo: ValueTuple(deliveryCount, ok)
+        ValueTuple<uint, bool> SetLocalCredit(int credit, bool autoRestore = true)
+        {
             lock (this.ThisLock)
             {
                 if (this.IsDetaching)
-                {
-                    return;
-                }
+                    return ValueTuple.Create((uint)0, false);
 
                 this.totalCredit = autoRestore ? credit : 0;
-                this.credit = credit;
-                this.restored = 0;
-                dc = this.deliveryCount;
+                this.credit      = credit;
+                this.restored    = 0;
+                return ValueTuple.Create((uint)this.deliveryCount, true);
             }
-
-            this.SendFlow(dc, (uint)credit, false);
         }
 
         /// <summary>
